@@ -1,0 +1,192 @@
+/*******************************************************
+  ESP32 DHT11 Monitor
+  - LCD (I2C)
+  - WebServer page
+  - ThingSpeak upload
+  - Blynk IoT (V0 Temp, V1 Humidity)
+  - WiFi priority + fallback
+
+  Public GitHub version:
+  - Secrets moved to secrets.h
+*******************************************************/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <BlynkSimpleEsp32.h>
+
+#include <hd44780.h>
+#include <hd44780ioClass/hd44780_I2Cexp.h>
+#include <DHT.h>
+
+#include "secrets.h"   // Keep this file private and add it to .gitignore
+
+BlynkTimer timer;
+
+// ================= PIN SETTINGS =================
+#define DHTPIN   4
+#define DHTTYPE  DHT11
+#define SDA_PIN  21
+#define SCL_PIN  22
+// ================================================
+
+DHT dht(DHTPIN, DHTTYPE);
+hd44780_I2Cexp lcd;
+WebServer server(80);
+
+float lastTemp = NAN;
+float lastHumi = NAN;
+
+unsigned long lastSensorMs = 0;
+unsigned long lastThingSpeakMs = 0;
+
+const unsigned long SENSOR_INTERVAL = 2000;
+const unsigned long THINGSPEAK_INTERVAL = 20000;
+
+// ------------------ LCD ------------------
+void updateLCD() {
+  lcd.clear();
+
+  if (isnan(lastTemp) || isnan(lastHumi)) {
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor Error");
+    return;
+  }
+
+  lcd.setCursor(0, 0);
+  lcd.print("Temp: ");
+  lcd.print((int)lastTemp);
+  lcd.print(" C");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Humi: ");
+  lcd.print((int)lastHumi);
+  lcd.print(" %");
+}
+// -----------------------------------------
+
+// ------------------ WEB ------------------
+String makePage() {
+  String page = "<html><head><meta http-equiv='refresh' content='5'></head><body>";
+  page += "<h2>ESP32 DHT Monitor</h2>";
+  page += "<p>Temperature: <b>" + String(lastTemp, 1) + " C</b></p>";
+  page += "<p>Humidity: <b>" + String(lastHumi, 1) + " %</b></p>";
+  page += "</body></html>";
+  return page;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", makePage());
+}
+// -----------------------------------------
+
+// ------------------ SENSOR ------------------
+void readSensor() {
+  lastHumi = dht.readHumidity();
+  lastTemp = dht.readTemperature();
+
+  Serial.print("Temp: ");
+  Serial.print(lastTemp);
+  Serial.print("  Humidity: ");
+  Serial.println(lastHumi);
+
+  updateLCD();
+}
+// ---------------------------------------------
+
+// ------------------ BLYNK ------------------
+void sendToBlynk() {
+  if (Blynk.connected() && !isnan(lastTemp) && !isnan(lastHumi)) {
+    Blynk.virtualWrite(V0, lastTemp);
+    Blynk.virtualWrite(V1, lastHumi);
+  }
+}
+// -------------------------------------------
+
+// ------------------ THINGSPEAK -------------
+void sendToThingSpeak() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (isnan(lastTemp) || isnan(lastHumi)) return;
+
+  HTTPClient http;
+  String url = "http://api.thingspeak.com/update?api_key=" + String(thingSpeakWriteKey) +
+               "&field1=" + String(lastTemp, 1) +
+               "&field2=" + String(lastHumi, 1);
+
+  http.begin(url);
+  http.GET();
+  http.end();
+}
+// -------------------------------------------
+
+// ------------------ WIFI ------------------
+void connectWiFi() {
+  WiFi.begin(ssid1, pass1);
+  Serial.print("Connecting to Primary WiFi");
+
+  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nPrimary failed. Trying fallback...");
+    WiFi.begin(ssid2, pass2);
+
+    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+      delay(500);
+      Serial.print(".");
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi Failed!");
+  }
+}
+// -------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  dht.begin();
+
+  lcd.begin(16, 2);
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Starting...");
+  delay(1000);
+
+  connectWiFi();
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect();
+
+  server.on("/", handleRoot);
+  server.begin();
+
+  timer.setInterval(2000L, sendToBlynk);
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+  server.handleClient();
+
+  unsigned long now = millis();
+
+  if (now - lastSensorMs >= SENSOR_INTERVAL) {
+    lastSensorMs = now;
+    readSensor();
+  }
+
+  if (now - lastThingSpeakMs >= THINGSPEAK_INTERVAL) {
+    lastThingSpeakMs = now;
+    sendToThingSpeak();
+  }
+}
